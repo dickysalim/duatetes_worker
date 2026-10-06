@@ -35,7 +35,8 @@ function normalisePhone(raw) {
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-    const { pathname, method } = url;
+    const { pathname } = url;
+    const { method } = request;
 
     if (method === 'OPTIONS') return new Response(null, { headers: CORS });
 
