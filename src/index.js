@@ -16,7 +16,6 @@ function json(data, status = 200) {
   });
 }
 
-/** Generate 8-char alphanumeric uppercase coupon code */
 function generateCode() {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
   const bytes = new Uint8Array(8);
@@ -24,11 +23,10 @@ function generateCode() {
   return Array.from(bytes, b => chars[b % chars.length]).join('');
 }
 
-/** Normalise phone → 62XXXXXXXXX (strip leading 0 or +) */
 function normalisePhone(raw) {
-  let p = raw.replace(/\D/g, '');          // digits only
-  if (p.startsWith('0')) p = p.slice(1);   // 08xx → 8xx
-  if (!p.startsWith('62')) p = '62' + p;   // prepend country code
+  let p = raw.replace(/\D/g, '');
+  if (p.startsWith('0')) p = p.slice(1);
+  if (!p.startsWith('62')) p = '62' + p;
   return p;
 }
 
@@ -54,20 +52,15 @@ export default {
     }
 
     // ── POST /api/coupons ─────────────────────────────────────────
-    // Body: { phone_number: "08123..." }
-    // Returns: { coupon_id, phone_number }
     if (pathname === '/api/coupons' && method === 'POST') {
       let body;
       try { body = await request.json(); } catch {
         return json({ error: 'Invalid JSON body' }, 400);
       }
-
       const rawPhone = (body.phone_number || '').trim();
       if (!rawPhone) return json({ error: 'phone_number is required' }, 400);
-
       const phone = normalisePhone(rawPhone);
 
-      // Generate a unique code (retry up to 5x on collision)
       let code, attempts = 0;
       while (attempts < 5) {
         code = generateCode();
@@ -80,15 +73,13 @@ export default {
 
       const now = new Date().toISOString();
       await env.DB.prepare(
-        `INSERT INTO coupons (coupon_id, date_generated, phone_number)
-         VALUES (?, ?, ?)`
+        `INSERT INTO coupons (coupon_id, date_generated, phone_number) VALUES (?, ?, ?)`
       ).bind(code, now, phone).run();
 
       return json({ coupon_id: code, phone_number: phone }, 201);
     }
 
     // ── POST /api/spin ────────────────────────────────────────────
-    // Body: { coupon_id, prize_won }
     if (pathname === '/api/spin' && method === 'POST') {
       let body;
       try { body = await request.json(); } catch {
@@ -113,7 +104,6 @@ export default {
     }
 
     // ── POST /api/redeem ──────────────────────────────────────────
-    // Body: { coupon_id }
     if (pathname === '/api/redeem' && method === 'POST') {
       let body;
       try { body = await request.json(); } catch {
@@ -135,6 +125,86 @@ export default {
         `UPDATE coupons SET is_redeemed = 1, date_redeemed = ? WHERE coupon_id = ?`
       ).bind(now, coupon_id).run();
 
+      return json({ ok: true });
+    }
+
+    // ── GET /api/prizes ───────────────────────────────────────────
+    if (pathname === '/api/prizes' && method === 'GET') {
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM prizes ORDER BY id ASC`
+      ).all();
+      return json({ prizes: results });
+    }
+
+    // ── POST /api/prizes ──────────────────────────────────────────
+    if (pathname === '/api/prizes' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const prize_name       = (body.prize_name || '').trim();
+      const prize_percentage = parseFloat(body.prize_percentage);
+      const icon             = (body.icon || '🎁').trim();
+      const is_active        = body.is_active === false ? 0 : 1;
+
+      if (!prize_name) return json({ error: 'prize_name is required' }, 400);
+      if (isNaN(prize_percentage) || prize_percentage < 0 || prize_percentage > 100) {
+        return json({ error: 'prize_percentage must be between 0 and 100' }, 400);
+      }
+
+      const existing = await env.DB.prepare(
+        `SELECT id FROM prizes WHERE LOWER(prize_name) = LOWER(?)`
+      ).bind(prize_name).first();
+      if (existing) return json({ error: 'A prize with that name already exists' }, 409);
+
+      const result = await env.DB.prepare(
+        `INSERT INTO prizes (prize_name, prize_percentage, icon, is_active) VALUES (?, ?, ?, ?)`
+      ).bind(prize_name, prize_percentage, icon, is_active).run();
+
+      return json({ id: result.meta.last_row_id, prize_name, prize_percentage, icon, is_active }, 201);
+    }
+
+    // ── PUT /api/prizes/:id ───────────────────────────────────────
+    const prizeIdMatch = pathname.match(/^\/api\/prizes\/(\d+)$/);
+
+    if (prizeIdMatch && method === 'PUT') {
+      const id = parseInt(prizeIdMatch[1]);
+      let body;
+      try { body = await request.json(); } catch {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const prize_name       = (body.prize_name || '').trim();
+      const prize_percentage = parseFloat(body.prize_percentage);
+      const icon             = (body.icon || '🎁').trim();
+      const is_active        = body.is_active ? 1 : 0;
+
+      if (!prize_name) return json({ error: 'prize_name is required' }, 400);
+      if (isNaN(prize_percentage) || prize_percentage < 0 || prize_percentage > 100) {
+        return json({ error: 'prize_percentage must be between 0 and 100' }, 400);
+      }
+
+      const duplicate = await env.DB.prepare(
+        `SELECT id FROM prizes WHERE LOWER(prize_name) = LOWER(?) AND id != ?`
+      ).bind(prize_name, id).first();
+      if (duplicate) return json({ error: 'A prize with that name already exists' }, 409);
+
+      const result = await env.DB.prepare(
+        `UPDATE prizes SET prize_name = ?, prize_percentage = ?, icon = ?, is_active = ? WHERE id = ?`
+      ).bind(prize_name, prize_percentage, icon, is_active, id).run();
+
+      if (result.meta.changes === 0) return json({ error: 'Prize not found' }, 404);
+      return json({ ok: true });
+    }
+
+    // ── DELETE /api/prizes/:id ────────────────────────────────────
+    if (prizeIdMatch && method === 'DELETE') {
+      const id = parseInt(prizeIdMatch[1]);
+      const result = await env.DB.prepare(
+        `DELETE FROM prizes WHERE id = ?`
+      ).bind(id).run();
+      if (result.meta.changes === 0) return json({ error: 'Prize not found' }, 404);
       return json({ ok: true });
     }
 
