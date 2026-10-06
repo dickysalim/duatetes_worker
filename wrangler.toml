@@ -1,0 +1,8 @@
+name = "duatetes-worker"
+main = "src/index.js"
+compatibility_date = "2026-10-06"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "duatetes_coupon"
+database_id = "53e765df-905a-4170-adef-e9bed9da4364"
