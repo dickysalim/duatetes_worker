@@ -128,6 +128,33 @@ export default {
       return json({ ok: true });
     }
 
+    // ── POST /api/validate ────────────────────────────────────────
+    // Body: { coupon_id }
+    // Returns: { valid: true, prizes: [...] } or { valid: false, error: '...' }
+    if (pathname === '/api/validate' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+
+      const coupon_id = (body.coupon_id || '').trim().toUpperCase();
+      if (!coupon_id) return json({ valid: false, error: 'Coupon code is required' });
+
+      const coupon = await env.DB.prepare(
+        `SELECT * FROM coupons WHERE coupon_id = ?`
+      ).bind(coupon_id).first();
+
+      if (!coupon) return json({ valid: false, error: 'Coupon not found. Check the code and try again.' });
+      if (coupon.prize_won) return json({ valid: false, error: 'This coupon has already been used.' });
+
+      // Fetch active prizes for the wheel
+      const { results: prizes } = await env.DB.prepare(
+        `SELECT * FROM prizes WHERE is_active = 1 ORDER BY id ASC`
+      ).all();
+
+      return json({ valid: true, coupon_id, prizes });
+    }
+
     // ── GET /api/prizes ───────────────────────────────────────────
     if (pathname === '/api/prizes' && method === 'GET') {
       const { results } = await env.DB.prepare(
