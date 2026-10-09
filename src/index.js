@@ -235,17 +235,31 @@ export default {
       return json({ ok: true });
     }
 
-    // ── GET /api/users ────────────────────────────────────────────
-    if (pathname === '/api/users' && method === 'GET') {
-      const { results } = await env.DB.prepare(
-        `SELECT * FROM users ORDER BY created_at DESC`
-      ).all();
-      return json({ users: results });
+    // ── GET /api/customers ────────────────────────────────────────
+    // ?q=xxx  → search by phone or name (LIKE)
+    if (pathname === '/api/customers' && method === 'GET') {
+      const q = url.searchParams.get('q') || '';
+      let results;
+      if (q) {
+        const like = `%${q}%`;
+        const { results: rows } = await env.DB.prepare(
+          `SELECT * FROM customers
+           WHERE phone_number LIKE ? OR name LIKE ?
+           ORDER BY name ASC LIMIT 10`
+        ).bind(like, like).all();
+        results = rows;
+      } else {
+        const { results: rows } = await env.DB.prepare(
+          `SELECT * FROM customers ORDER BY created_at DESC`
+        ).all();
+        results = rows;
+      }
+      return json({ customers: results });
     }
 
-    // ── POST /api/users ───────────────────────────────────────────
-    // Creates or updates a user by phone_number (upsert)
-    if (pathname === '/api/users' && method === 'POST') {
+    // ── POST /api/customers ───────────────────────────────────────
+    // Upsert by phone_number — updates name if phone already exists
+    if (pathname === '/api/customers' && method === 'POST') {
       let body;
       try { body = await request.json(); } catch {
         return json({ error: 'Invalid JSON body' }, 400);
@@ -255,49 +269,48 @@ export default {
       if (!phone) return json({ error: 'phone_number is required' }, 400);
 
       await env.DB.prepare(
-        `INSERT INTO users (phone_number, name)
+        `INSERT INTO customers (phone_number, name)
          VALUES (?, ?)
          ON CONFLICT(phone_number) DO UPDATE SET name = excluded.name`
       ).bind(phone, name).run();
 
-      const user = await env.DB.prepare(
-        `SELECT * FROM users WHERE phone_number = ?`
+      const customer = await env.DB.prepare(
+        `SELECT * FROM customers WHERE phone_number = ?`
       ).bind(phone).first();
-      return json(user);
+      return json(customer);
     }
 
-    // ── PUT /api/users/:id ────────────────────────────────────────
-    const userIdMatch = pathname.match(/^\/api\/users\/(\d+)$/);
-    if (userIdMatch && method === 'PUT') {
+    // ── PUT /api/customers/:id ────────────────────────────────────
+    const customerIdMatch = pathname.match(/^\/api\/customers\/(\d+)$/);
+    if (customerIdMatch && method === 'PUT') {
       let body;
       try { body = await request.json(); } catch {
         return json({ error: 'Invalid JSON body' }, 400);
       }
-      const id    = parseInt(userIdMatch[1]);
+      const id    = parseInt(customerIdMatch[1]);
       const phone = (body.phone_number || '').trim();
       const name  = (body.name || '').trim();
       if (!phone) return json({ error: 'phone_number is required' }, 400);
 
-      // Check phone uniqueness excluding self
       const conflict = await env.DB.prepare(
-        `SELECT id FROM users WHERE phone_number = ? AND id != ?`
+        `SELECT id FROM customers WHERE phone_number = ? AND id != ?`
       ).bind(phone, id).first();
       if (conflict) return json({ error: 'Phone number already in use' }, 409);
 
       const result = await env.DB.prepare(
-        `UPDATE users SET phone_number = ?, name = ? WHERE id = ?`
+        `UPDATE customers SET phone_number = ?, name = ? WHERE id = ?`
       ).bind(phone, name, id).run();
-      if (result.meta.changes === 0) return json({ error: 'User not found' }, 404);
+      if (result.meta.changes === 0) return json({ error: 'Customer not found' }, 404);
       return json({ ok: true });
     }
 
-    // ── DELETE /api/users/:id ─────────────────────────────────────
-    if (userIdMatch && method === 'DELETE') {
-      const id = parseInt(userIdMatch[1]);
+    // ── DELETE /api/customers/:id ─────────────────────────────────
+    if (customerIdMatch && method === 'DELETE') {
+      const id = parseInt(customerIdMatch[1]);
       const result = await env.DB.prepare(
-        `DELETE FROM users WHERE id = ?`
+        `DELETE FROM customers WHERE id = ?`
       ).bind(id).run();
-      if (result.meta.changes === 0) return json({ error: 'User not found' }, 404);
+      if (result.meta.changes === 0) return json({ error: 'Customer not found' }, 404);
       return json({ ok: true });
     }
 
