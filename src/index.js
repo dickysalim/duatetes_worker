@@ -46,9 +46,27 @@ export default {
     // ── GET /api/coupons ─────────────────────────────────────────
     if (pathname === '/api/coupons' && method === 'GET') {
       const { results } = await env.DB.prepare(
-        `SELECT * FROM coupons ORDER BY date_generated DESC LIMIT 100`
+        `SELECT c.*, cu.name AS customer_name
+         FROM coupons c
+         LEFT JOIN customers cu ON cu.phone_number = c.phone_number
+         ORDER BY c.date_generated DESC LIMIT 200`
       ).all();
       return json({ coupons: results });
+    }
+
+    // ── GET /api/coupons/:coupon_id ───────────────────────────────
+    // Lookup a single coupon by its code; joins customer name if available
+    const couponLookupMatch = pathname.match(/^\/api\/coupons\/([A-Z0-9]{1,12})$/i);
+    if (couponLookupMatch && method === 'GET') {
+      const id = couponLookupMatch[1].toUpperCase();
+      const coupon = await env.DB.prepare(
+        `SELECT c.*, cu.name AS customer_name
+         FROM coupons c
+         LEFT JOIN customers cu ON cu.phone_number = c.phone_number
+         WHERE c.coupon_id = ?`
+      ).bind(id).first();
+      if (!coupon) return json({ error: 'Coupon not found' }, 404);
+      return json(coupon);
     }
 
     // ── POST /api/coupons ─────────────────────────────────────────
