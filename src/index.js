@@ -235,6 +235,72 @@ export default {
       return json({ ok: true });
     }
 
+    // ── GET /api/users ────────────────────────────────────────────
+    if (pathname === '/api/users' && method === 'GET') {
+      const { results } = await env.DB.prepare(
+        `SELECT * FROM users ORDER BY created_at DESC`
+      ).all();
+      return json({ users: results });
+    }
+
+    // ── POST /api/users ───────────────────────────────────────────
+    // Creates or updates a user by phone_number (upsert)
+    if (pathname === '/api/users' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      const phone = (body.phone_number || '').trim();
+      const name  = (body.name || '').trim();
+      if (!phone) return json({ error: 'phone_number is required' }, 400);
+
+      await env.DB.prepare(
+        `INSERT INTO users (phone_number, name)
+         VALUES (?, ?)
+         ON CONFLICT(phone_number) DO UPDATE SET name = excluded.name`
+      ).bind(phone, name).run();
+
+      const user = await env.DB.prepare(
+        `SELECT * FROM users WHERE phone_number = ?`
+      ).bind(phone).first();
+      return json(user);
+    }
+
+    // ── PUT /api/users/:id ────────────────────────────────────────
+    const userIdMatch = pathname.match(/^\/api\/users\/(\d+)$/);
+    if (userIdMatch && method === 'PUT') {
+      let body;
+      try { body = await request.json(); } catch {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      const id    = parseInt(userIdMatch[1]);
+      const phone = (body.phone_number || '').trim();
+      const name  = (body.name || '').trim();
+      if (!phone) return json({ error: 'phone_number is required' }, 400);
+
+      // Check phone uniqueness excluding self
+      const conflict = await env.DB.prepare(
+        `SELECT id FROM users WHERE phone_number = ? AND id != ?`
+      ).bind(phone, id).first();
+      if (conflict) return json({ error: 'Phone number already in use' }, 409);
+
+      const result = await env.DB.prepare(
+        `UPDATE users SET phone_number = ?, name = ? WHERE id = ?`
+      ).bind(phone, name, id).run();
+      if (result.meta.changes === 0) return json({ error: 'User not found' }, 404);
+      return json({ ok: true });
+    }
+
+    // ── DELETE /api/users/:id ─────────────────────────────────────
+    if (userIdMatch && method === 'DELETE') {
+      const id = parseInt(userIdMatch[1]);
+      const result = await env.DB.prepare(
+        `DELETE FROM users WHERE id = ?`
+      ).bind(id).run();
+      if (result.meta.changes === 0) return json({ error: 'User not found' }, 404);
+      return json({ ok: true });
+    }
+
     return json({ error: 'Not found' }, 404);
   },
 };
