@@ -30,9 +30,10 @@ function normalisePhone(raw) {
   return p;
 }
 
-// Active prize set rules: 5–15 prizes, each % 0–100 summing to exactly 100,
-// each slices integer >= 1, total slices 10–15. Returns an error string or null.
-const MIN_PRIZES = 5, MAX_PRIZES = 15, MIN_SLICES = 10, MAX_SLICES = 15;
+// Active prize set rules: 5–12 prizes, each % 0–100 summing to exactly 100,
+// each slices integer >= 1, total slices 10–12. Returns an error string or null.
+const MAX_PRIZE_NAME = 14;
+const MIN_PRIZES = 5, MAX_PRIZES = 12, MIN_SLICES = 10, MAX_SLICES = 12;
 function validateActiveSet(list) {
   if (list.length < MIN_PRIZES || list.length > MAX_PRIZES) {
     return `Active prizes must be ${MIN_PRIZES}–${MAX_PRIZES} (got ${list.length})`;
@@ -148,7 +149,7 @@ export default {
       const now = new Date().toISOString();
       await env.DB.prepare(
         autoRedeem
-          ? `UPDATE coupons SET prize_won = ?, date_prize_won = ?, is_redeemed = 1, date_redeemed = ? WHERE coupon_id = ?`
+          ? `UPDATE coupons SET prize_won = ?, date_prize_won = ?, is_fail = 1, is_redeemed = 1, date_redeemed = ? WHERE coupon_id = ?`
           : `UPDATE coupons SET prize_won = ?, date_prize_won = ? WHERE coupon_id = ?`
       ).bind(...(autoRedeem ? [prize_won, now, now, coupon_id] : [prize_won, now, coupon_id])).run();
 
@@ -193,7 +194,10 @@ export default {
       if (!coupon_id) return json({ valid: false, error: 'Coupon code is required' });
 
       const coupon = await env.DB.prepare(
-        `SELECT * FROM coupons WHERE coupon_id = ?`
+        `SELECT c.*, cu.name AS customer_name
+         FROM coupons c
+         LEFT JOIN customers cu ON cu.phone_number = c.phone_number
+         WHERE c.coupon_id = ?`
       ).bind(coupon_id).first();
 
       if (!coupon) return json({ valid: false, error: 'Coupon not found. Check the code and try again.' });
@@ -206,7 +210,33 @@ export default {
          ORDER BY s.prize_pos ASC`
       ).all();
 
-      return json({ valid: true, coupon_id, prizes });
+      return json({ valid: true, coupon_id, customer_name: coupon.customer_name || null, prizes });
+    }
+
+    // ── GET /api/winners ──────────────────────────────────────────
+    // Public recent-winners feed: spun coupons that did not land on a fail prize.
+    // Exposes customer name and prize only, never phone numbers.
+    if (pathname === '/api/winners' && method === 'GET') {
+      const { results: winners } = await env.DB.prepare(
+        `SELECT cu.name AS customer_name, c.prize_won, p.icon, c.date_prize_won
+         FROM coupons c
+         LEFT JOIN customers cu ON cu.phone_number = c.phone_number
+         LEFT JOIN prizes p ON p.prize_name = c.prize_won
+         WHERE c.prize_won IS NOT NULL AND c.is_fail = 0
+         ORDER BY c.date_prize_won DESC LIMIT 10`
+      ).all();
+      return json({ winners });
+    }
+
+    // ── GET /api/wheel ────────────────────────────────────────────
+    // Public wheel layout for the idle screen. No percentages: odds only come with a valid coupon.
+    if (pathname === '/api/wheel' && method === 'GET') {
+      const { results: prizes } = await env.DB.prepare(
+        `SELECT s.prize_pos, s.prize_id, s.slices, p.prize_name, p.icon, p.is_fail
+         FROM prize_settings s JOIN prizes p ON p.prize_id = s.prize_id
+         ORDER BY s.prize_pos ASC`
+      ).all();
+      return json({ prizes });
     }
 
     // ── GET /api/prizes ───────────────────────────────────────────
@@ -233,6 +263,7 @@ export default {
       const is_fail    = body.is_fail ? 1 : 0;
 
       if (!prize_name) return json({ error: 'prize_name is required' }, 400);
+      if ([...prize_name].length > MAX_PRIZE_NAME) return json({ error: `Prize name must be ${MAX_PRIZE_NAME} characters or fewer` }, 400);
 
       const existing = await env.DB.prepare(
         `SELECT prize_id FROM prizes WHERE LOWER(prize_name) = LOWER(?)`
@@ -290,6 +321,7 @@ export default {
       const is_fail    = body.is_fail ? 1 : 0;
 
       if (!prize_name) return json({ error: 'prize_name is required' }, 400);
+      if ([...prize_name].length > MAX_PRIZE_NAME) return json({ error: `Prize name must be ${MAX_PRIZE_NAME} characters or fewer` }, 400);
 
       const duplicate = await env.DB.prepare(
         `SELECT prize_id FROM prizes WHERE LOWER(prize_name) = LOWER(?) AND prize_id != ?`
