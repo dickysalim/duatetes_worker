@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "dev": "./wr dev --port 8790",
+    "deploy": "./wr deploy"
   },
   "devDependencies": {
     "wrangler": "^3.0.0"

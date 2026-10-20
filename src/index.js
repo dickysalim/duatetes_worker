@@ -30,6 +30,32 @@ function normalisePhone(raw) {
   return p;
 }
 
+// Active prize set rules: 5–15 prizes, each % 0–100 summing to exactly 100,
+// each slices integer >= 1, total slices 10–15. Returns an error string or null.
+const MIN_PRIZES = 5, MAX_PRIZES = 15, MIN_SLICES = 10, MAX_SLICES = 15;
+function validateActiveSet(list) {
+  if (list.length < MIN_PRIZES || list.length > MAX_PRIZES) {
+    return `Active prizes must be ${MIN_PRIZES}–${MAX_PRIZES} (got ${list.length})`;
+  }
+  const seen = new Set();
+  let pctSum = 0, sliceSum = 0;
+  for (const p of list) {
+    if (!Number.isInteger(p.prize_id) || seen.has(p.prize_id)) return 'Invalid or duplicate prize id';
+    seen.add(p.prize_id);
+    if (typeof p.percentage !== 'number' || !(p.percentage >= 0 && p.percentage <= 100)) {
+      return 'Percentage must be between 0 and 100';
+    }
+    if (!Number.isInteger(p.slices) || p.slices < 1) return 'Slices must be a whole number of at least 1';
+    pctSum += p.percentage;
+    sliceSum += p.slices;
+  }
+  if (Math.abs(pctSum - 100) > 0.001) return `Percentages must total 100% (got ${Math.round(pctSum * 1000) / 1000}%)`;
+  if (sliceSum < MIN_SLICES || sliceSum > MAX_SLICES) {
+    return `Total slices must be ${MIN_SLICES}–${MAX_SLICES} (got ${sliceSum})`;
+  }
+  return null;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -98,6 +124,7 @@ export default {
     }
 
     // ── POST /api/spin ────────────────────────────────────────────
+    // A prize flagged is_fail is auto-redeemed the moment it is won.
     if (pathname === '/api/spin' && method === 'POST') {
       let body;
       try { body = await request.json(); } catch {
@@ -113,12 +140,19 @@ export default {
       if (!coupon) return json({ error: 'Invalid coupon' }, 404);
       if (coupon.prize_won) return json({ error: 'Coupon already used' }, 409);
 
+      const prize = await env.DB.prepare(
+        `SELECT is_fail FROM prizes WHERE prize_name = ?`
+      ).bind(prize_won).first();
+      const autoRedeem = !!(prize && prize.is_fail);
+
       const now = new Date().toISOString();
       await env.DB.prepare(
-        `UPDATE coupons SET prize_won = ?, date_prize_won = ? WHERE coupon_id = ?`
-      ).bind(prize_won, now, coupon_id).run();
+        autoRedeem
+          ? `UPDATE coupons SET prize_won = ?, date_prize_won = ?, is_redeemed = 1, date_redeemed = ? WHERE coupon_id = ?`
+          : `UPDATE coupons SET prize_won = ?, date_prize_won = ? WHERE coupon_id = ?`
+      ).bind(...(autoRedeem ? [prize_won, now, now, coupon_id] : [prize_won, now, coupon_id])).run();
 
-      return json({ ok: true, prize_won });
+      return json({ ok: true, prize_won, is_fail: autoRedeem });
     }
 
     // ── POST /api/redeem ──────────────────────────────────────────
@@ -165,49 +199,80 @@ export default {
       if (!coupon) return json({ valid: false, error: 'Coupon not found. Check the code and try again.' });
       if (coupon.prize_won) return json({ valid: false, error: 'This coupon has already been used.' });
 
-      // Fetch active prizes for the wheel
+      // Wheel layout: prize_settings joined to prize details, in wheel order
       const { results: prizes } = await env.DB.prepare(
-        `SELECT * FROM prizes WHERE is_active = 1 ORDER BY id ASC`
+        `SELECT s.prize_pos, s.prize_id, s.percentage, s.slices, p.prize_name, p.icon, p.is_fail
+         FROM prize_settings s JOIN prizes p ON p.prize_id = s.prize_id
+         ORDER BY s.prize_pos ASC`
       ).all();
 
       return json({ valid: true, coupon_id, prizes });
     }
 
     // ── GET /api/prizes ───────────────────────────────────────────
+    // Every prize plus its wheel settings (prize_pos null = not on the wheel).
     if (pathname === '/api/prizes' && method === 'GET') {
       const { results } = await env.DB.prepare(
-        `SELECT * FROM prizes ORDER BY id ASC`
+        `SELECT p.prize_id, p.prize_name, p.icon, p.is_fail, s.prize_pos, s.percentage, s.slices
+         FROM prizes p LEFT JOIN prize_settings s ON s.prize_id = p.prize_id
+         ORDER BY p.prize_id ASC`
       ).all();
       return json({ prizes: results });
     }
 
     // ── POST /api/prizes ──────────────────────────────────────────
+    // Adds a prize to the catalogue. It is not on the wheel until it is in prize_settings.
     if (pathname === '/api/prizes' && method === 'POST') {
       let body;
       try { body = await request.json(); } catch {
         return json({ error: 'Invalid JSON body' }, 400);
       }
 
-      const prize_name       = (body.prize_name || '').trim();
-      const prize_percentage = parseFloat(body.prize_percentage);
-      const icon             = (body.icon || '🎁').trim();
-      const is_active        = body.is_active === false ? 0 : 1;
+      const prize_name = (body.prize_name || '').trim();
+      const icon       = (body.icon || '🎁').trim();
+      const is_fail    = body.is_fail ? 1 : 0;
 
       if (!prize_name) return json({ error: 'prize_name is required' }, 400);
-      if (isNaN(prize_percentage) || prize_percentage < 0 || prize_percentage > 100) {
-        return json({ error: 'prize_percentage must be between 0 and 100' }, 400);
-      }
 
       const existing = await env.DB.prepare(
-        `SELECT id FROM prizes WHERE LOWER(prize_name) = LOWER(?)`
+        `SELECT prize_id FROM prizes WHERE LOWER(prize_name) = LOWER(?)`
       ).bind(prize_name).first();
       if (existing) return json({ error: 'A prize with that name already exists' }, 409);
 
       const result = await env.DB.prepare(
-        `INSERT INTO prizes (prize_name, prize_percentage, icon, is_active) VALUES (?, ?, ?, ?)`
-      ).bind(prize_name, prize_percentage, icon, is_active).run();
+        `INSERT INTO prizes (prize_name, icon, is_fail) VALUES (?, ?, ?)`
+      ).bind(prize_name, icon, is_fail).run();
 
-      return json({ id: result.meta.last_row_id, prize_name, prize_percentage, icon, is_active }, 201);
+      return json({ prize_id: result.meta.last_row_id, prize_name, icon, is_fail, prize_pos: null, percentage: null, slices: null }, 201);
+    }
+
+    // ── PUT /api/prize-settings ───────────────────────────────────
+    // Body: { settings: [{ prize_id, percentage, slices }, ...] }
+    // Replaces the whole wheel layout atomically; prize_pos = array order (1..n).
+    if (pathname === '/api/prize-settings' && method === 'PUT') {
+      let body;
+      try { body = await request.json(); } catch {
+        return json({ error: 'Invalid JSON body' }, 400);
+      }
+      const list = Array.isArray(body.settings) ? body.settings : null;
+      if (!list) return json({ error: 'settings array is required' }, 400);
+
+      const err = validateActiveSet(list);
+      if (err) return json({ error: err }, 400);
+
+      const ids = list.map(p => p.prize_id);
+      const { results: found } = await env.DB.prepare(
+        `SELECT prize_id FROM prizes WHERE prize_id IN (${ids.map(() => '?').join(',')})`
+      ).bind(...ids).all();
+      if (found.length !== ids.length) return json({ error: 'Unknown prize id in list' }, 400);
+
+      await env.DB.batch([
+        env.DB.prepare(`DELETE FROM prize_settings`),
+        ...list.map((p, i) => env.DB.prepare(
+          `INSERT INTO prize_settings (prize_pos, prize_id, percentage, slices) VALUES (?, ?, ?, ?)`
+        ).bind(i + 1, p.prize_id, p.percentage, p.slices)),
+      ]);
+      return json({ ok: true });
     }
 
     // ── PUT /api/prizes/:id ───────────────────────────────────────
@@ -220,24 +285,20 @@ export default {
         return json({ error: 'Invalid JSON body' }, 400);
       }
 
-      const prize_name       = (body.prize_name || '').trim();
-      const prize_percentage = parseFloat(body.prize_percentage);
-      const icon             = (body.icon || '🎁').trim();
-      const is_active        = body.is_active ? 1 : 0;
+      const prize_name = (body.prize_name || '').trim();
+      const icon       = (body.icon || '🎁').trim();
+      const is_fail    = body.is_fail ? 1 : 0;
 
       if (!prize_name) return json({ error: 'prize_name is required' }, 400);
-      if (isNaN(prize_percentage) || prize_percentage < 0 || prize_percentage > 100) {
-        return json({ error: 'prize_percentage must be between 0 and 100' }, 400);
-      }
 
       const duplicate = await env.DB.prepare(
-        `SELECT id FROM prizes WHERE LOWER(prize_name) = LOWER(?) AND id != ?`
+        `SELECT prize_id FROM prizes WHERE LOWER(prize_name) = LOWER(?) AND prize_id != ?`
       ).bind(prize_name, id).first();
       if (duplicate) return json({ error: 'A prize with that name already exists' }, 409);
 
       const result = await env.DB.prepare(
-        `UPDATE prizes SET prize_name = ?, prize_percentage = ?, icon = ?, is_active = ? WHERE id = ?`
-      ).bind(prize_name, prize_percentage, icon, is_active, id).run();
+        `UPDATE prizes SET prize_name = ?, icon = ?, is_fail = ? WHERE prize_id = ?`
+      ).bind(prize_name, icon, is_fail, id).run();
 
       if (result.meta.changes === 0) return json({ error: 'Prize not found' }, 404);
       return json({ ok: true });
@@ -246,8 +307,12 @@ export default {
     // ── DELETE /api/prizes/:id ────────────────────────────────────
     if (prizeIdMatch && method === 'DELETE') {
       const id = parseInt(prizeIdMatch[1]);
+      const onWheel = await env.DB.prepare(`SELECT prize_id FROM prize_settings WHERE prize_id = ?`).bind(id).first();
+      if (onWheel) {
+        return json({ error: 'Move the prize out of Prize Settings before deleting it' }, 409);
+      }
       const result = await env.DB.prepare(
-        `DELETE FROM prizes WHERE id = ?`
+        `DELETE FROM prizes WHERE prize_id = ?`
       ).bind(id).run();
       if (result.meta.changes === 0) return json({ error: 'Prize not found' }, 404);
       return json({ ok: true });
