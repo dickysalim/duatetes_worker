@@ -1,0 +1,13 @@
+#!/bin/sh
+# Usage: ./set-pin 123456
+# Hashes the back-office PIN (salted SHA-256) and stores it as the ADMIN_PIN_HASH
+# Worker secret. Takes effect immediately; existing logins stay valid.
+set -e
+cd "$(dirname "$0")"
+case "$1" in
+  [0-9][0-9][0-9][0-9][0-9][0-9]) ;;
+  *) echo "PIN must be exactly 6 digits" >&2; exit 1 ;;
+esac
+salt=$(openssl rand -hex 8)
+hash=$(printf '%s' "$salt$1" | shasum -a 256 | cut -d' ' -f1)
+printf '%s' "$salt:$hash" | ./wr secret put ADMIN_PIN_HASH
