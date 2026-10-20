@@ -12,12 +12,23 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Expose-Headers': 'X-Session-Token',
+  // Let browsers reuse the preflight answer instead of asking before every call
+  'Access-Control-Max-Age': '86400',
 };
 
-function json(data, status = 200) {
+// Public read-only feeds can be reused briefly by browsers and the edge.
+const SHORT_CACHE = { 'Cache-Control': 'public, max-age=15' };
+
+// Wheel layout as the customer app sees it (no odds).
+const WHEEL_SQL =
+  `SELECT s.prize_pos, s.prize_id, s.slices, p.prize_name, p.icon, p.is_fail
+   FROM prize_settings s JOIN prizes p ON p.prize_id = s.prize_id
+   ORDER BY s.prize_pos ASC`;
+
+function json(data, status = 200, headers) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', ...CORS },
+    headers: { 'Content-Type': 'application/json', ...CORS, ...headers },
   });
 }
 
@@ -102,11 +113,16 @@ function safeEqual(a, b) {
 }
 
 // HMAC-SHA256 under SESSION_SECRET; `label` keeps sessions, tickets and picks from being interchangeable.
+// The imported key is kept for the life of the isolate (the secret rarely changes).
+let hmacKey = null, hmacKeySecret = null;
 async function hmac(env, label, data) {
-  const key = await crypto.subtle.importKey(
-    'raw', enc.encode(env.SESSION_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  return crypto.subtle.sign('HMAC', key, enc.encode(`${label}:${data}`));
+  if (hmacKeySecret !== env.SESSION_SECRET) {
+    hmacKey = await crypto.subtle.importKey(
+      'raw', enc.encode(env.SESSION_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+    );
+    hmacKeySecret = env.SESSION_SECRET;
+  }
+  return crypto.subtle.sign('HMAC', hmacKey, enc.encode(`${label}:${data}`));
 }
 
 async function signToken(env, label, payload) {
@@ -151,21 +167,20 @@ async function authenticate(request, env) {
 const LOGIN_MAX_FAILS = 5;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 
-async function loginBlocked(env, ip, now) {
-  const row = await env.DB.prepare(`SELECT fails, first_fail FROM auth_attempts WHERE ip = ?`).bind(ip).first();
-  return !!row && now - Date.parse(row.first_fail) < LOGIN_WINDOW_MS && row.fails >= LOGIN_MAX_FAILS;
+async function getLoginAttempts(env, ip) {
+  return env.DB.prepare(`SELECT fails, first_fail FROM auth_attempts WHERE ip = ?`).bind(ip).first();
 }
 
-async function recordLoginFail(env, ip, now) {
-  const iso = new Date(now).toISOString();
-  const row = await env.DB.prepare(`SELECT first_fail FROM auth_attempts WHERE ip = ?`).bind(ip).first();
+const loginBlocked = (row, now) =>
+  !!row && now - Date.parse(row.first_fail) < LOGIN_WINDOW_MS && row.fails >= LOGIN_MAX_FAILS;
+
+async function recordLoginFail(env, ip, row, now) {
   if (!row || now - Date.parse(row.first_fail) >= LOGIN_WINDOW_MS) {
-    await env.DB.prepare(`INSERT OR REPLACE INTO auth_attempts (ip, fails, first_fail) VALUES (?, 1, ?)`).bind(ip, iso).run();
+    await env.DB.prepare(`INSERT OR REPLACE INTO auth_attempts (ip, fails, first_fail) VALUES (?, 1, ?)`)
+      .bind(ip, new Date(now).toISOString()).run();
   } else {
     await env.DB.prepare(`UPDATE auth_attempts SET fails = fails + 1 WHERE ip = ?`).bind(ip).run();
   }
-  await env.DB.prepare(`DELETE FROM auth_attempts WHERE first_fail < ?`)
-    .bind(new Date(now - LOGIN_WINDOW_MS).toISOString()).run();
 }
 
 // ── Prize pick ────────────────────────────────────────────────────
@@ -253,7 +268,8 @@ async function route(request, env) {
 
     const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
     const now = Date.now();
-    if (await loginBlocked(env, ip, now)) {
+    const attempts = await getLoginAttempts(env, ip);
+    if (loginBlocked(attempts, now)) {
       return json({ error: 'Too many attempts. Try again in 15 minutes.' }, 429);
     }
 
@@ -261,18 +277,12 @@ async function route(request, env) {
     const [salt, expected] = env.ADMIN_PIN_HASH.split(':');
     const ok = /^\d{6}$/.test(pin) && safeEqual(await sha256Hex(salt + pin), expected || '');
     if (!ok) {
-      await recordLoginFail(env, ip, now);
+      await recordLoginFail(env, ip, attempts, now);
       return json({ error: 'Incorrect PIN' }, 401);
     }
 
-    await env.DB.prepare(`DELETE FROM auth_attempts WHERE ip = ?`).bind(ip).run();
+    if (attempts) await env.DB.prepare(`DELETE FROM auth_attempts WHERE ip = ?`).bind(ip).run();
     return json({ token: await signToken(env, 'session', { t: now }) });
-  }
-
-  // ── GET /api/session ─────────────────────────────────────────
-  // Auth check for the back office; the refreshed token header does the rest.
-  if (pathname === '/api/session' && method === 'GET') {
-    return json({ ok: true });
   }
 
   // ── GET /api/coupons ─────────────────────────────────────────
@@ -310,22 +320,16 @@ async function route(request, env) {
     const phone = normalisePhone(rawPhone);
     if (!validPhone(phone)) return json({ error: 'Invalid phone number' }, 400);
 
-    let code = null;
-    for (let attempt = 0; attempt < 5 && !code; attempt++) {
-      const candidate = generateCode();
-      const existing = await env.DB.prepare(
-        `SELECT coupon_id FROM coupons WHERE coupon_id = ?`
-      ).bind(candidate).first();
-      if (!existing) code = candidate;
-    }
-    if (!code) return json({ error: 'Could not generate a unique code, try again' }, 500);
-
+    // One write per try: a clash with an existing code is ignored and retried
     const now = new Date().toISOString();
-    await env.DB.prepare(
-      `INSERT INTO coupons (coupon_id, date_generated, phone_number) VALUES (?, ?, ?)`
-    ).bind(code, now, phone).run();
-
-    return json({ coupon_id: code, phone_number: phone }, 201);
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const code = generateCode();
+      const result = await env.DB.prepare(
+        `INSERT OR IGNORE INTO coupons (coupon_id, date_generated, phone_number) VALUES (?, ?, ?)`
+      ).bind(code, now, phone).run();
+      if (result.meta.changes === 1) return json({ coupon_id: code, phone_number: phone }, 201);
+    }
+    return json({ error: 'Could not generate a unique code, try again' }, 500);
   }
 
   // ── POST /api/validate ────────────────────────────────────────
@@ -339,21 +343,18 @@ async function route(request, env) {
     const coupon_id = String(body.coupon_id || '').trim().toUpperCase();
     if (!coupon_id) return json({ valid: false, error: 'Kode kupon wajib diisi.' });
 
-    const coupon = await env.DB.prepare(
-      `SELECT c.prize_won, cu.name AS customer_name
-       FROM coupons c
-       LEFT JOIN customers cu ON cu.phone_number = c.phone_number
-       WHERE c.coupon_id = ?`
-    ).bind(coupon_id).first();
+    const [coupon, { results: prizes }] = await Promise.all([
+      env.DB.prepare(
+        `SELECT c.prize_won, cu.name AS customer_name
+         FROM coupons c
+         LEFT JOIN customers cu ON cu.phone_number = c.phone_number
+         WHERE c.coupon_id = ?`
+      ).bind(coupon_id).first(),
+      env.DB.prepare(WHEEL_SQL).all(),
+    ]);
 
     if (!coupon) return json({ valid: false, error: 'Kupon tidak ditemukan. Periksa kode dan coba lagi.' });
     if (coupon.prize_won) return json({ valid: false, error: 'Kupon ini sudah digunakan.' });
-
-    const { results: prizes } = await env.DB.prepare(
-      `SELECT s.prize_pos, s.prize_id, s.slices, p.prize_name, p.icon, p.is_fail
-       FROM prize_settings s JOIN prizes p ON p.prize_id = s.prize_id
-       ORDER BY s.prize_pos ASC`
-    ).all();
     if (!prizes.length) return json({ valid: false, error: 'Roda hadiah belum tersedia. Coba lagi nanti.' });
 
     return json({ valid: true, coupon_id, customer_name: coupon.customer_name || null, prizes });
@@ -370,13 +371,13 @@ async function route(request, env) {
     const coupon_id = String(body.coupon_id || '').trim().toUpperCase();
     if (!coupon_id) return json({ error: 'coupon_id required' }, 400);
 
-    const coupon = await env.DB.prepare(
-      `SELECT prize_won FROM coupons WHERE coupon_id = ?`
-    ).bind(coupon_id).first();
+    // Coupon check and prize pick are independent, so run them together
+    const [coupon, prize] = await Promise.all([
+      env.DB.prepare(`SELECT prize_won FROM coupons WHERE coupon_id = ?`).bind(coupon_id).first(),
+      pickPrize(env, coupon_id),
+    ]);
     if (!coupon) return json({ error: 'Kupon tidak ditemukan.' }, 404);
     if (coupon.prize_won) return json({ error: 'Kupon ini sudah digunakan.' }, 409);
-
-    const prize = await pickPrize(env, coupon_id);
     if (!prize) return json({ error: 'Roda hadiah belum tersedia.' }, 503);
 
     const ticket = await signToken(env, 'ticket', {
@@ -449,18 +450,14 @@ async function route(request, env) {
        WHERE c.prize_won IS NOT NULL AND c.is_fail = 0
        ORDER BY c.date_prize_won DESC LIMIT 10`
     ).all();
-    return json({ winners });
+    return json({ winners }, 200, SHORT_CACHE);
   }
 
   // ── GET /api/wheel ────────────────────────────────────────────
   // Public wheel layout for the idle screen. No percentages: odds stay on the server.
   if (pathname === '/api/wheel' && method === 'GET') {
-    const { results: prizes } = await env.DB.prepare(
-      `SELECT s.prize_pos, s.prize_id, s.slices, p.prize_name, p.icon, p.is_fail
-       FROM prize_settings s JOIN prizes p ON p.prize_id = s.prize_id
-       ORDER BY s.prize_pos ASC`
-    ).all();
-    return json({ prizes });
+    const { results: prizes } = await env.DB.prepare(WHEEL_SQL).all();
+    return json({ prizes }, 200, SHORT_CACHE);
   }
 
   // ── GET /api/prizes ───────────────────────────────────────────
